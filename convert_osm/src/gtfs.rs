@@ -89,7 +89,7 @@ pub fn import(map: &mut RawMap) -> Result<()> {
         // Points are usually sorted, but just in case...
         pts.sort_by_key(|(_, seq)| *seq);
         let pts: Vec<Pt2D> = pts.into_iter().map(|(pt, _)| pt).collect();
-        match PolyLine::new(pts) {
+        match PolyLine::deduping_new(pts) {
             Ok(pl) => {
                 route.shape = pl;
                 transit_routes.push(route);
