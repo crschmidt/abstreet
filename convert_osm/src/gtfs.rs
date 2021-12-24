@@ -142,8 +142,8 @@ pub fn import(map: &mut RawMap) -> Result<()> {
         .deserialize()
     {
         let rec: Stop = rec?;
-        if stop_ids.contains(&rec.stop_id) {
-            let position = LonLat::new(rec.stop_lon, rec.stop_lat).to_pt(&map.gps_bounds);
+        if stop_ids.contains(&rec.stop_id) && rec.stop_lon.is_some() && rec.stop_lat.is_some() {
+            let position = LonLat::new(rec.stop_lon.unwrap(), rec.stop_lat.unwrap()).to_pt(&map.gps_bounds);
             if map.boundary_polygon.contains_pt(position) {
                 map.transit_stops.insert(
                     rec.stop_id.0.clone(),
@@ -212,8 +212,8 @@ struct Shape {
 #[derive(Deserialize)]
 struct Stop {
     stop_id: StopID,
-    stop_lon: f64,
-    stop_lat: f64,
+    stop_lon: Option<f64>,
+    stop_lat: Option<f64>,
     stop_name: String,
 }
 
