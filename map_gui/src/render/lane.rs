@@ -1,10 +1,10 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
 
-use geom::{Angle, ArrowCap, Circle, Distance, Line, PolyLine, Polygon, Pt2D};
-use map_model::{
-    BufferType, Direction, DrivingSide, Lane, LaneID, LaneType, Map, Road, RoadID, TurnID,
-};
+use lyon_geom::math::F64Point;
+use lyon_geom::{CubicBezierSegment, QuadraticBezierSegment};
+
+use geom::{Angle, ArrowCap, Circle, Distance, InfiniteLine, Line, PolyLine, Polygon, Pt2D};
+use map_model::{BufferType, Direction, DrivingSide, Lane, LaneID, LaneType, Map, Road, TurnID};
 use widgetry::{Color, Drawable, GeomBatch, GfxCtx, Prerender, RewriteColor};
 
 use crate::render::{DrawOptions, Renderable, OUTLINE_THICKNESS};
@@ -306,10 +306,6 @@ fn calculate_driving_lines(lane: &Lane, road: &Road) -> Vec<Polygon> {
 }
 
 fn calculate_turn_markings(map: &Map, lane: &Lane) -> Vec<Polygon> {
-    if lane.length() < Distance::meters(7.0) {
-        return Vec::new();
-    }
-
     // Does this lane connect to every other possible outbound lane of the same type, excluding
     // U-turns to the same road? If so, then there's nothing unexpected to communicate.
     let i = map.get_i(lane.dst_i);
@@ -328,33 +324,128 @@ fn calculate_turn_markings(map: &Map, lane: &Lane) -> Vec<Polygon> {
         return Vec::new();
     }
 
-    // Don't call out the strange lane-changing in intersections. Per target road, find the average
-    // turn angle.
-    let mut angles_per_road: HashMap<RoadID, Vec<Angle>> = HashMap::new();
-    for turn in map.get_turns_from_lane(lane.id) {
-        angles_per_road
-            .entry(turn.id.dst.road)
-            .or_insert_with(Vec::new)
-            .push(turn.angle());
-    }
+    // Only show one arrow per road. They should all be the same angle, so just use last.
+    let mut turn_angles_roads: Vec<_> = map
+        .get_turns_from_lane(lane.id)
+        .iter()
+        .map(|t| (t.id.dst.road, t.angle()))
+        .collect();
+    turn_angles_roads.dedup_by(|(r1, _), (r2, _)| r1 == r2);
+
+    let turn_angles: Vec<_> = turn_angles_roads.iter().map(|(_, a)| a).collect();
 
     let mut results = Vec::new();
     let thickness = Distance::meters(0.2);
 
-    let common_base = lane.lane_center_pts.exact_slice(
-        lane.length() - Distance::meters(7.0),
-        lane.length() - Distance::meters(5.0),
-    );
-    results.push(common_base.make_polygons(thickness));
+    // The distance of the end of a straight arrow from the intersection
+    let location = Distance::meters(4.0);
+    // The length of a straight arrow (turn arrows are shorter)
+    let length_max = Distance::meters(3.0);
+    // The width of a double (left+right) u-turn arrow
+    let width_max = Distance::meters(3.0)
+        .min(lane.width - 4.0 * thickness)
+        .max(Distance::ZERO);
+    // The width of the leftmost/rightmost turn arrow
+    let (left, right) = turn_angles
+        .iter()
+        .map(|a| {
+            width_max / 2.0
+                * (a.simple_shortest_rotation_towards(Angle::ZERO) / 2.0)
+                    .to_radians()
+                    .sin()
+                    .min(0.5)
+        })
+        .fold((Distance::ZERO, Distance::ZERO), |(min, max), s| {
+            (s.min(min), s.max(max))
+        });
+    // Put the middle, not the straight line of the marking in the middle of the lane
+    let offset = (right + left) / 2.0;
 
-    for (_, angles) in angles_per_road.into_iter() {
-        let avg = Angle::average(angles);
+    // If the lane is too short to fit the arrows, don't make them
+    if lane.length() < length_max + location {
+        return Vec::new();
+    }
+
+    let (start_pt_unshifted, start_angle) = lane
+        .lane_center_pts
+        .must_dist_along(lane.length() - (length_max + location));
+    let start_pt = start_pt_unshifted.project_away(
+        offset.abs(),
+        start_angle.rotate_degs(if offset > Distance::ZERO { -90.0 } else { 90.0 }),
+    );
+
+    for turn_angle in turn_angles {
+        let half_angle =
+            Angle::degrees(turn_angle.simple_shortest_rotation_towards(Angle::ZERO) / 2.0);
+
+        let end_pt = start_pt
+            .project_away(
+                half_angle.normalized_radians().cos() * length_max,
+                start_angle,
+            )
+            .project_away(
+                half_angle.normalized_radians().sin().abs().min(0.5) * width_max,
+                start_angle
+                    + if half_angle > Angle::ZERO {
+                        Angle::degrees(90.0)
+                    } else {
+                        Angle::degrees(-90.0)
+                    },
+            );
+
+        fn to_pt(pt: Pt2D) -> F64Point {
+            lyon_geom::math::point(pt.x(), pt.y())
+        }
+
+        fn from_pt(pt: F64Point) -> Pt2D {
+            Pt2D::new(pt.x, pt.y)
+        }
+
+        let intersection = InfiniteLine::from_pt_angle(start_pt, start_angle)
+            .intersection(&InfiniteLine::from_pt_angle(
+                end_pt,
+                start_angle + *turn_angle,
+            ))
+            .unwrap_or(start_pt);
+        let curve = if turn_angle.approx_parallel(
+            Angle::ZERO,
+            (length_max / (width_max / 2.0)).atan().to_degrees(),
+        ) || start_pt.approx_eq(intersection, geom::EPSILON_DIST)
+        {
+            CubicBezierSegment {
+                from: to_pt(start_pt),
+                ctrl1: to_pt(start_pt.project_away(length_max / 2.0, start_angle)),
+                ctrl2: to_pt(
+                    end_pt.project_away(length_max / 2.0, (start_angle + *turn_angle).opposite()),
+                ),
+                to: to_pt(end_pt),
+            }
+        } else {
+            QuadraticBezierSegment {
+                from: to_pt(start_pt),
+                ctrl: to_pt(intersection),
+                to: to_pt(end_pt),
+            }
+            .to_cubic()
+        };
+
+        let pieces = 5;
+        let mut curve_pts: Vec<_> = (0..=pieces)
+            .map(|i| from_pt(curve.sample(1.0 / f64::from(pieces) * f64::from(i))))
+            .collect();
+        // add extra piece to ensure end segment is tangent.
+        curve_pts.push(
+            curve_pts
+                .last()
+                .unwrap()
+                .project_away(thickness, start_angle + *turn_angle),
+        );
+        curve_pts.dedup();
+
         results.push(
-            PolyLine::must_new(vec![
-                common_base.last_pt(),
-                common_base.last_pt().project_away(lane.width / 2.0, avg),
-            ])
-            .make_arrow(thickness, ArrowCap::Triangle),
+            PolyLine::new(curve_pts)
+                .unwrap()
+                .make_arrow(thickness, ArrowCap::Triangle),
         );
     }
 
